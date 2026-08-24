@@ -81,7 +81,11 @@ func (c *Client) Login(ctx context.Context) error {
 			c.logger.Printf("proxy >> %s %s", req.Method, req.URL.Path)
 		},
 		ModifyResponse: func(resp *http.Response) error {
-			c.logger.Printf("proxy << %d %s (%s)", resp.StatusCode, resp.Request.URL.Path, resp.Header.Get("Content-Type"))
+			path := ""
+			if resp.Request != nil && resp.Request.URL != nil {
+				path = resp.Request.URL.Path
+			}
+			c.logger.Printf("proxy << %d %s (%s)", resp.StatusCode, path, resp.Header.Get("Content-Type"))
 			if loc := resp.Header.Get("Location"); loc != "" {
 				c.logger.Printf("proxy << Location: %s", loc)
 			}
@@ -166,7 +170,9 @@ func replaceWithLoginPage(resp *http.Response, html string) {
 	resp.Header.Set("Content-Type", "text/html; charset=utf-8")
 	resp.Body = io.NopCloser(strings.NewReader(html))
 	resp.ContentLength = int64(len(html))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(html)))
 	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Transfer-Encoding")
 }
 
 func newLoginTransport(scheme string) (http.RoundTripper, error) {
@@ -290,7 +296,9 @@ func rewriteLoginResponse(resp *http.Response, localOrigin, targetHost string) e
 
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	resp.ContentLength = int64(len(body))
+	resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("Transfer-Encoding")
 
 	return nil
 }
@@ -328,18 +336,28 @@ func sanitizeCookie(cookie string) string {
 }
 
 func readResponseBody(resp *http.Response) ([]byte, error) {
-	var reader io.Reader = resp.Body
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		gz, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return nil, err
-		}
-		defer gz.Close()
-		reader = gz
-	}
-	data, err := io.ReadAll(reader)
+	data, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	return data, err
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.Header.Get("Content-Encoding") != "gzip" {
+		return data, nil
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		// Upstream may have already decompressed while keeping the header.
+		return data, nil
+	}
+	defer gz.Close()
+
+	decompressed, err := io.ReadAll(gz)
+	if err != nil {
+		return data, nil
+	}
+	return decompressed, nil
 }
 
 func openDefaultBrowser(url string) {
